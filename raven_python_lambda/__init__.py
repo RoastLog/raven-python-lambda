@@ -49,20 +49,19 @@ def configure_raven_client(config):
         'ignore_exceptions': config.get('RAVEN_IGNORE_EXCEPTIONS', []),
         'release': os.environ.get('SENTRY_RELEASE'),
         'environment': 'Local' if config['is_local'] else os.environ.get('SENTRY_ENVIRONMENT'),
-        'tags':
-            {
-                'lambda': os.environ.get('AWS_LAMBDA_FUNCTION_NAME'),
-                'version': os.environ.get('AWS_LAMBDA_FUNCTION_VERSION'),
-                'memory_size': os.environ.get('AWS_LAMBDA_FUNCTION_MEMORY_SIZE'),
-                'log_group': os.environ.get('AWS_LAMBDA_LOG_GROUP_NAME'),
-                'log_stream': os.environ.get('AWS_LAMBDA_LOG_STREAM_NAME'),
-                'service_name': os.environ.get('SERVERLESS_SERVICE'),
-                'stage': os.environ.get('SERVERLESS_STAGE'),
-                'alias': os.environ.get('SERVERLESS_ALIAS'),
-                'region': os.environ.get('SERVERLESS_REGION') or os.environ.get('AWS_REGION')
-            },
-        'transport':
-            SQSTransport if "sqs_name" in os.environ.get('SENTRY_DSN', "") else HTTPTransport,
+        'tags': {
+            'lambda': os.environ.get('AWS_LAMBDA_FUNCTION_NAME'),
+            'version': os.environ.get('AWS_LAMBDA_FUNCTION_VERSION'),
+            'memory_size': os.environ.get('AWS_LAMBDA_FUNCTION_MEMORY_SIZE'),
+            'log_group': os.environ.get('AWS_LAMBDA_LOG_GROUP_NAME'),
+            'log_stream': os.environ.get('AWS_LAMBDA_LOG_STREAM_NAME'),
+            'service_name': os.environ.get('SERVERLESS_SERVICE'),
+            'stage': os.environ.get('SERVERLESS_STAGE'),
+            'alias': os.environ.get('SERVERLESS_ALIAS'),
+            'region': os.environ.get('SERVERLESS_REGION') or os.environ.get('AWS_REGION')
+        },
+        'transport': SQSTransport
+        if "sqs_name" in os.environ.get('SENTRY_DSN', "") else HTTPTransport,
         'dsn': os.environ.get('SENTRY_DSN')
     }
 
@@ -101,8 +100,8 @@ class RavenLambdaWrapper(object):
             'timeout_warning_threshold': float(os.environ.get('SENTRY_TIMEOUT_THRESHOLD', 0.50)),
             'capture_memory_warnings': boolval(os.environ.get('SENTRY_CAPTURE_MEMORY', True)),
             'memory_warning_threshold': float(os.environ.get('SENTRY_MEMORY_THRESHOLD', 0.75)),
-            'capture_unhandled_exceptions':
-                boolval(os.environ.get('SENTRY_CAPTURE_UNHANDLED', True)),
+            'capture_unhandled_exceptions': boolval(os.environ.get('SENTRY_CAPTURE_UNHANDLED',
+                                                                   True)),
             'auto_bread_crumbs': boolval(os.environ.get('SENTRY_AUTO_BREADCRUMBS', True)),
             'capture_errors': boolval(os.environ.get('SENTRY_CAPTURE_ERRORS', True)),
             'filter_local': boolval(os.environ.get('SENTRY_FILTER_LOCAL', True)),
@@ -120,8 +119,8 @@ class RavenLambdaWrapper(object):
             return
 
         if self.config.get('raven_client'):
-            assert self.config.get('raven_client'
-                                  ) and not isinstance(self.config.get('raven_client'), Client)
+            assert self.config.get('raven_client') and not isinstance(
+                self.config.get('raven_client'), Client)
         else:
             self.config['raven_client'] = configure_raven_client(self.config)
 
@@ -130,16 +129,20 @@ class RavenLambdaWrapper(object):
             handler.setLevel(self.config['log_level'])
             setup_logging(handler)
 
-    def __add_request_context_to_raven(self, event, raven_context):
+    def __get_request_context(self, event):
         if not hasattr(event, 'get'):
             return
 
         if not event.get('requestContext'):
             return
 
-        identity = event['requestContext']['identity']
+        request_context = event['requestContext']
+        identity = request_context['identity']
+
+        context = {}
+
         if identity:
-            raven_context['user'] = {
+            context['user'] = {
                 'id': identity.get('cognitoIdentityId', None),
                 'username': identity.get('user', None),
                 'ip_address': identity.get('sourceIp', None),
@@ -149,29 +152,30 @@ class RavenLambdaWrapper(object):
             }
 
         # Add additional tags for AWS_PROXY endpoints
-        tags = raven_context.get['tags']
-        tags.update(
-            {
-                'api_id': event['requestContext']['apiId'],
-                'api_stage': event['requestContext']['stage'],
-                'http_method': event['requestContext']['httpMethod']
-            }
-        )
+        context['tags'] = {
+            'api_id': request_context['apiId'],
+            'api_stage': request_context['stage'],
+            'http_method': request_context['httpMethod']
+        }
 
-    def __add_cloudwatch_context_to_raven(self, event, raven_context):
+        return context
+
+    def __get_cloudwatch_context(self, event):
         if not hasattr(event, 'get'):
             return
 
         if not event.get('detail'):
             return
 
-        tags = raven_context['tags']
+        tags = {}
 
         if event.get('userIdentity'):
             tags['cloudwatch_principal_id'] = event['userIdentity']['principalId']
 
         if event.get('awsRegion'):
             tags['cloudwatch_region'] = event['awsRegion']
+
+        return tags
 
     def __add_breadcrumbs_to_raven(self, event):
         if not self.config.get('auto_bread_crumbs'):
@@ -215,8 +219,13 @@ class RavenLambdaWrapper(object):
                 'tags': {}
             }
 
-            self.__add_request_context_to_raven(event, raven_context)
-            self.__add_cloudwatch_context_to_raven(event, raven_context)
+            ctx = self.__get_request_context(event)
+            if ctx:
+                raven_context.update(ctx)
+
+            ctx = self.__get_cloudwatch_context(event)
+            if ctx:
+                raven_context['tags'].update(ctx)
 
             # rethrow exception to halt lambda execution
             timers = []
@@ -245,8 +254,7 @@ def timeout_warning(config, context):
     config['raven_client'].captureMessage(
         'Function Execution Time Warning',
         level='warning',
-        extra={'TimeRemainingInMsec': context.get_remaining_time_in_millis()}
-    )
+        extra={'TimeRemainingInMsec': context.get_remaining_time_in_millis()})
 
 
 def memory_warning(config, context):
@@ -258,14 +266,12 @@ def memory_warning(config, context):
     memory_threshold = config.get('memory_warning_threshold')
 
     if p >= memory_threshold:
-        config['raven_client'].captureMessage(
-            'Memory Usage Warning',
-            level='warning',
-            extra={
-                'MemoryLimitInMB': context.memory_limit_in_mb,
-                'MemoryUsedInMB': math.floor(used)
-            }
-        )
+        config['raven_client'].captureMessage('Memory Usage Warning',
+                                              level='warning',
+                                              extra={
+                                                  'MemoryLimitInMB': context.memory_limit_in_mb,
+                                                  'MemoryUsedInMB': math.floor(used)
+                                              })
     else:
         # nothing to do check back later
         Timer(.5, memory_warning, (config, context)).start()
